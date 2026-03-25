@@ -92,8 +92,9 @@ impl burn_tensor::TensorMetadata for IntelFloatTensor {
 
 /// Attempt to perform matmul via OpenVINO, targeting NPU > GPU > CPU.
 ///
-/// Returns `Ok(result)` if OpenVINO executed successfully, `Err(())` if the
-/// runtime is unavailable or the operation failed for any reason.
+/// Dispatch matmul to OpenVINO NPU. Handles batched (3D+) tensors by looping
+/// over batch dims and running each 2D slice on NPU.
+/// Returns `Err(())` if OpenVINO runtime is unavailable.
 #[cfg(feature = "intel")]
 pub fn openvino_matmul(
     lhs: &IntelFloatTensor,
@@ -101,26 +102,29 @@ pub fn openvino_matmul(
 ) -> Result<IntelFloatTensor, ()> {
     use openvino::{Core, DeviceType, ElementType, Shape as OvShape, Tensor as OvTensor};
 
-    // Only worth dispatching to NPU for large matmuls (heuristic threshold).
-    let m = if lhs.shape.len() >= 2 {
-        lhs.shape[lhs.shape.len() - 2]
-    } else {
-        1
-    };
-    let n = if rhs.shape.len() >= 2 {
-        rhs.shape[rhs.shape.len() - 1]
-    } else {
-        1
-    };
-    let k = *lhs.shape.last().unwrap_or(&1);
+    let lhs_ndim = lhs.shape.len();
+    let rhs_ndim = rhs.shape.len();
+    if lhs_ndim < 2 || rhs_ndim < 2 { return Err(()); }
 
-    // Skip OpenVINO for small matrices or batched (3D+) tensors.
-    // Our IR XML is 2D only — batched matmul falls back to cpu_matmul.
-    if m * n * k < 4096 || lhs.shape.len() > 2 || rhs.shape.len() > 2 {
-        return Err(());
-    }
+    let m = lhs.shape[lhs_ndim - 2];
+    let k = lhs.shape[lhs_ndim - 1];
+    let n = rhs.shape[rhs_ndim - 1];
 
-    // Build OpenVINO IR XML for MatMul.
+    // Skip OpenVINO overhead for small matmuls
+    if m * k * n < 4096 { return Err(()); }
+
+    // Compute batch dimensions: everything before the last 2 dims
+    let lhs_batch: Vec<usize> = lhs.shape[..lhs_ndim - 2].to_vec();
+    let rhs_batch: Vec<usize> = rhs.shape[..rhs_ndim - 2].to_vec();
+    // Batch shapes must match (or be empty for 2D)
+    if lhs_batch != rhs_batch { return Err(()); }
+    let batch_size: usize = lhs_batch.iter().product::<usize>().max(1);
+
+    let lhs_stride = m * k; // elements per batch slice in lhs
+    let rhs_stride = k * n; // elements per batch slice in rhs
+    let out_stride = m * n;
+
+    // Build and compile the 2D matmul model once, reuse for all batch slices
     let ir_xml = format!(
         r#"<?xml version="1.0"?>
 <net name="matmul" version="11">
@@ -154,17 +158,13 @@ pub fn openvino_matmul(
     );
 
     let mut core = Core::new().map_err(|_| ())?;
+    let model = core.read_model_from_buffer(ir_xml.as_bytes(), None).map_err(|_| ())?;
 
-    // Read model from XML buffer (no weights tensor needed for MatMul).
-    let model = core
-        .read_model_from_buffer(ir_xml.as_bytes(), None)
-        .map_err(|_| ())?;
-
-    // Try devices in priority order: NPU, GPU, CPU.
-    let devices: [DeviceType; 3] = [DeviceType::NPU, DeviceType::GPU, DeviceType::CPU];
+    // Try NPU > GPU > CPU
+    let devices = [DeviceType::NPU, DeviceType::GPU, DeviceType::CPU];
     let mut compiled = None;
-    for device in &devices {
-        if let Ok(c) = core.compile_model(&model, device.to_owned()) {
+    for dev in &devices {
+        if let Ok(c) = core.compile_model(&model, dev.to_owned()) {
             compiled = Some(c);
             break;
         }
@@ -172,39 +172,37 @@ pub fn openvino_matmul(
     let mut compiled = compiled.ok_or(())?;
     let mut request = compiled.create_infer_request().map_err(|_| ())?;
 
-    // Set input tensors.
-    let lhs_shape = OvShape::new(&[m as i64, k as i64]).map_err(|_| ())?;
-    let lhs_tensor = {
-        let mut t = OvTensor::new(ElementType::F32, &lhs_shape).map_err(|_| ())?;
-        {
-            let buf = t.get_data_mut::<f32>().map_err(|_| ())?;
-            buf.copy_from_slice(&lhs.data[..m * k]);
-        }
-        t
-    };
-    let rhs_shape = OvShape::new(&[k as i64, n as i64]).map_err(|_| ())?;
-    let rhs_tensor = {
-        let mut t = OvTensor::new(ElementType::F32, &rhs_shape).map_err(|_| ())?;
-        {
-            let buf = t.get_data_mut::<f32>().map_err(|_| ())?;
-            buf.copy_from_slice(&rhs.data[..k * n]);
-        }
-        t
-    };
+    let lhs_ov_shape = OvShape::new(&[m as i64, k as i64]).map_err(|_| ())?;
+    let rhs_ov_shape = OvShape::new(&[k as i64, n as i64]).map_err(|_| ())?;
 
-    request
-        .set_input_tensor_by_index(0, &lhs_tensor)
-        .map_err(|_| ())?;
-    request
-        .set_input_tensor_by_index(1, &rhs_tensor)
-        .map_err(|_| ())?;
+    // Run each batch slice through the compiled model
+    let mut result_data = Vec::with_capacity(batch_size * out_stride);
+    for b in 0..batch_size {
+        let lhs_off = b * lhs_stride;
+        let rhs_off = b * rhs_stride;
 
-    request.infer().map_err(|_| ())?;
+        let mut lt = OvTensor::new(ElementType::F32, &lhs_ov_shape).map_err(|_| ())?;
+        lt.get_data_mut::<f32>().map_err(|_| ())?
+            .copy_from_slice(&lhs.data[lhs_off..lhs_off + lhs_stride]);
 
-    let output = request.get_output_tensor_by_index(0).map_err(|_| ())?;
-    let out_data: Vec<f32> = output.get_data::<f32>().map_err(|_| ())?.to_vec();
+        let mut rt = OvTensor::new(ElementType::F32, &rhs_ov_shape).map_err(|_| ())?;
+        rt.get_data_mut::<f32>().map_err(|_| ())?
+            .copy_from_slice(&rhs.data[rhs_off..rhs_off + rhs_stride]);
 
-    Ok(IntelFloatTensor::new(out_data, vec![m, n]))
+        request.set_input_tensor_by_index(0, &lt).map_err(|_| ())?;
+        request.set_input_tensor_by_index(1, &rt).map_err(|_| ())?;
+        request.infer().map_err(|_| ())?;
+
+        let output = request.get_output_tensor_by_index(0).map_err(|_| ())?;
+        result_data.extend_from_slice(output.get_data::<f32>().map_err(|_| ())?);
+    }
+
+    // Output shape: [...batch_dims, m, n]
+    let mut out_shape = lhs_batch;
+    out_shape.push(m);
+    out_shape.push(n);
+
+    Ok(IntelFloatTensor::new(result_data, out_shape))
 }
 
 /// CPU fallback matmul (simple triple loop, no SIMD).
