@@ -395,7 +395,7 @@ impl Backend for NpuBurnBackend {
     }
 
     fn name(_device: &Self::Device) -> String {
-        String::from("npu (MLTensor)")
+        String::from("Apple ANE")
     }
 
     fn seed(_device: &Self::Device, seed: u64) {
@@ -430,7 +430,7 @@ impl Backend for NpuBurnBackend {
     }
 
     fn name(_device: &Self::Device) -> String {
-        String::from("npu (ndarray)")
+        String::from("CPU fallback")
     }
 
     fn seed(_device: &Self::Device, seed: u64) {
@@ -2637,9 +2637,9 @@ impl Backend for NpuBurnBackend {
 
     fn name(_device: &Self::Device) -> String {
         #[cfg(feature = "intel")]
-        { String::from("npu (Intel OpenVINO)") }
+        { String::from("Intel NPU") }
         #[cfg(feature = "qualcomm")]
-        { String::from("npu (Qualcomm QNN)") }
+        { String::from("Qualcomm Hexagon") }
     }
 
     fn seed(_device: &Self::Device, seed: u64) {
