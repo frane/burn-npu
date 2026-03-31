@@ -11,6 +11,18 @@
 //! a CPU implementation transparently.
 
 use burn_tensor::{DType, Shape};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+// Cache compiled OpenVINO models by (m, k, n) shape to avoid recompilation per call.
+#[cfg(feature = "intel")]
+static OV_CACHE: std::sync::LazyLock<Mutex<HashMap<(usize, usize, usize), OvCompiledMatmul>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(feature = "intel")]
+struct OvCompiledMatmul {
+    compiled: openvino::CompiledModel,
+}
 
 // ---------------------------------------------------------------------------
 // IntelFloatTensor
@@ -124,9 +136,15 @@ pub fn openvino_matmul(
     let rhs_stride = k * n; // elements per batch slice in rhs
     let out_stride = m * n;
 
-    // Build and compile the 2D matmul model once, reuse for all batch slices
-    let ir_xml = format!(
-        r#"<?xml version="1.0"?>
+    let lhs_ov_shape = OvShape::new(&[m as i64, k as i64]).map_err(|_| ())?;
+    let rhs_ov_shape = OvShape::new(&[k as i64, n as i64]).map_err(|_| ())?;
+
+    // Get or compile the model for this (m, k, n) shape — cached across calls
+    let cache_key = (m, k, n);
+    let mut cache = OV_CACHE.lock().map_err(|_| ())?;
+    if !cache.contains_key(&cache_key) {
+        let ir_xml = format!(
+            r#"<?xml version="1.0"?>
 <net name="matmul" version="11">
   <layers>
     <layer id="0" name="lhs" type="Parameter" version="opset1">
@@ -155,25 +173,24 @@ pub fn openvino_matmul(
     <edge from-layer="2" from-port="2" to-layer="3" to-port="0"/>
   </edges>
 </net>"#
-    );
+        );
 
-    let mut core = Core::new().map_err(|_| ())?;
-    let model = core.read_model_from_buffer(ir_xml.as_bytes(), None).map_err(|_| ())?;
+        let mut core = Core::new().map_err(|_| ())?;
+        let model = core.read_model_from_buffer(ir_xml.as_bytes(), None).map_err(|_| ())?;
 
-    // Try NPU > GPU > CPU
-    let devices = [DeviceType::NPU, DeviceType::GPU, DeviceType::CPU];
-    let mut compiled = None;
-    for dev in &devices {
-        if let Ok(c) = core.compile_model(&model, dev.to_owned()) {
-            compiled = Some(c);
-            break;
+        let devices = [DeviceType::NPU, DeviceType::GPU, DeviceType::CPU];
+        let mut compiled = None;
+        for dev in &devices {
+            if let Ok(c) = core.compile_model(&model, dev.to_owned()) {
+                compiled = Some(c);
+                break;
+            }
         }
+        cache.insert(cache_key, OvCompiledMatmul { compiled: compiled.ok_or(())? });
     }
-    let mut compiled = compiled.ok_or(())?;
-    let mut request = compiled.create_infer_request().map_err(|_| ())?;
-
-    let lhs_ov_shape = OvShape::new(&[m as i64, k as i64]).map_err(|_| ())?;
-    let rhs_ov_shape = OvShape::new(&[k as i64, n as i64]).map_err(|_| ())?;
+    let entry = cache.get_mut(&cache_key).unwrap();
+    let mut request = entry.compiled.create_infer_request().map_err(|_| ())?;
+    drop(cache); // release lock before running inference
 
     // Run each batch slice through the compiled model
     let mut result_data = Vec::with_capacity(batch_size * out_stride);

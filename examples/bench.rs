@@ -177,9 +177,13 @@ fn main() {
         println!("{:<30} {:>12}   (no GPU adapter found)", "burn-wgpu (GPU)", "N/A");
     }
 
-    // NpuBurnBackend (NPU via MLTensor)
+    // NpuBurnBackend
     #[cfg(feature = "apple")]
-    run_bench::<burn_npu::NpuBurnBackend>("burn-npu (Apple NPU)", 10);
+    run_bench::<burn_npu::NpuBurnBackend>("burn-npu (Apple ANE)", 10);
+    #[cfg(feature = "intel")]
+    run_bench::<burn_npu::NpuBurnBackend>("burn-npu (Intel NPU)", 10);
+    #[cfg(feature = "qualcomm")]
+    run_bench::<burn_npu::NpuBurnBackend>("burn-npu (Qualcomm)", 10);
 
     println!("{}", "─".repeat(58));
 
