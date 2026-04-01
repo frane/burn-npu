@@ -24,6 +24,12 @@ struct OvCompiledMatmul {
     compiled: openvino::CompiledModel,
 }
 
+/// Load the OpenVINO shared library (required for runtime-linking feature).
+#[cfg(feature = "intel")]
+fn ensure_openvino_loaded() -> Result<(), ()> {
+    openvino_sys::load().map_err(|_| ())
+}
+
 // ---------------------------------------------------------------------------
 // IntelFloatTensor
 // ---------------------------------------------------------------------------
@@ -114,6 +120,8 @@ pub fn openvino_matmul(
 ) -> Result<IntelFloatTensor, ()> {
     use openvino::{Core, DeviceType, ElementType, Shape as OvShape, Tensor as OvTensor};
 
+    ensure_openvino_loaded()?;
+
     let lhs_ndim = lhs.shape.len();
     let rhs_ndim = rhs.shape.len();
     if lhs_ndim < 2 || rhs_ndim < 2 { return Err(()); }
@@ -199,19 +207,23 @@ pub fn openvino_matmul(
         let rhs_off = b * rhs_stride;
 
         let mut lt = OvTensor::new(ElementType::F32, &lhs_ov_shape).map_err(|_| ())?;
-        lt.get_data_mut::<f32>().map_err(|_| ())?
-            .copy_from_slice(&lhs.data[lhs_off..lhs_off + lhs_stride]);
+        let lt_buf = lt.get_data_mut::<f32>().map_err(|_| ())?;
+        if lt_buf.len() != lhs_stride { return Err(()); }
+        lt_buf.copy_from_slice(&lhs.data[lhs_off..lhs_off + lhs_stride]);
 
         let mut rt = OvTensor::new(ElementType::F32, &rhs_ov_shape).map_err(|_| ())?;
-        rt.get_data_mut::<f32>().map_err(|_| ())?
-            .copy_from_slice(&rhs.data[rhs_off..rhs_off + rhs_stride]);
+        let rt_buf = rt.get_data_mut::<f32>().map_err(|_| ())?;
+        if rt_buf.len() != rhs_stride { return Err(()); }
+        rt_buf.copy_from_slice(&rhs.data[rhs_off..rhs_off + rhs_stride]);
 
         request.set_input_tensor_by_index(0, &lt).map_err(|_| ())?;
         request.set_input_tensor_by_index(1, &rt).map_err(|_| ())?;
         request.infer().map_err(|_| ())?;
 
         let output = request.get_output_tensor_by_index(0).map_err(|_| ())?;
-        result_data.extend_from_slice(output.get_data::<f32>().map_err(|_| ())?);
+        let out_buf = output.get_data::<f32>().map_err(|_| ())?;
+        if out_buf.len() != out_stride { return Err(()); }
+        result_data.extend_from_slice(out_buf);
     }
 
     // Output shape: [...batch_dims, m, n]
