@@ -1,6 +1,6 @@
 [package]
 name = "burn-npu"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "NPU backend for the Burn deep learning framework. Drop-in replacement that runs on Apple Neural Engine, Intel NPU, and Qualcomm Hexagon."
 license = "MIT OR Apache-2.0"
